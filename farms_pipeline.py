@@ -3,553 +3,898 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-import openpyxl
-from openpyxl.utils import get_column_letter
-import subprocess
-import sys
+from openpyxl import load_workbook
 
 
-# ----------------------------
-# Text normalization
-# ----------------------------
+# ============================================================
+# Constants / Regex
+# ============================================================
+KI_LABEL_RE = re.compile(r"^\s*(\d+)\s*期\s*$")
 
-def norm_text(x):
-    if not isinstance(x, str):
-        return x
-    x = unicodedata.normalize("NFKC", x).strip()
-    x = re.sub(r"\s+", " ", x)
-    return x
 
-def key_norm(s: str) -> str:
+# ============================================================
+# 期判定（10/1〜翌9/30）
+# ============================================================
+def calc_ki(d) -> int:
     """
-    月初報告の企業名キー一致専用。
-    見た目から同じなら一致させるため、改行・空白を除去して比較する。
+    期判定（10/1〜翌9/30）
+    例）2024-10-01〜2025-09-30 -> 58期
+       2025-10-01〜2026-09-30 -> 59期
     """
-    s = unicodedata.normalize("NFKC", str(s))
+    ts = pd.to_datetime(d, errors="coerce")
+    if pd.isna(ts):
+        return -1
+    ki_year = ts.year + 1 if ts.month >= 10 else ts.year  # 終了年
+    return ki_year - 1967  # ki_year=2025 -> 58期
+
+
+# ============================================================
+# Utils
+# ============================================================
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def resolve_path(path_str: str, label: str = "file") -> Path:
+    p = Path(path_str).expanduser()
+    if not p.exists():
+        eprint(f"[ERROR] {label} not found: {p}")
+        eprint(f"[INFO] cwd: {Path.cwd()}")
+        sys.exit(2)
+    return p.resolve()
+
+
+def ensure_outdir(path_str: str) -> Path:
+    outdir = Path(path_str).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
+
+
+def parse_target_months(month: Optional[int], months: Optional[str]) -> List[int]:
+    if month is not None:
+        if not (1 <= month <= 12):
+            raise SystemExit(f"[ERROR] invalid --month: {month} (1-12)")
+        return [month]
+
+    s = (months or "").strip().lower()
+    if s == "all":
+        return list(range(10, 13)) + list(range(1, 10))
+
+    items = [x.strip() for x in s.split(",") if x.strip()]
+    if not items:
+        raise SystemExit("[ERROR] invalid --months (use all or like 10,11,12)")
+
+    out: List[int] = []
+    for x in items:
+        m = int(x)
+        if not (1 <= m <= 12):
+            raise SystemExit(f"[ERROR] invalid month in --months: {m} (1-12)")
+        out.append(m)
+    return out
+
+
+def parse_kis(kis_str: str | None, fallback_ki: int) -> List[int]:
+    if kis_str is None or str(kis_str).strip() == "":
+        return [int(fallback_ki)]
+    items = [x.strip() for x in str(kis_str).split(",") if x.strip()]
+    out: List[int] = []
+    for x in items:
+        m = re.search(r"\d+", x)
+        if not m:
+            raise SystemExit(f"[ERROR] invalid --kis item: {x}")
+        out.append(int(m.group()))
+    # 重複除去・昇順
+    return sorted(set(out))
+
+
+def make_suffix(target_months: List[int]) -> str:
+    if len(target_months) == 12 and target_months == (list(range(10, 13)) + list(range(1, 10))):
+        return "all"
+    if len(target_months) == 1:
+        return f"{target_months[0]:02d}"
+    return "m" + "-".join(f"{m:02d}" for m in target_months)
+
+
+def make_report_outname(ki: int, target_months: List[int]) -> str:
+    return f"report_{ki}ki_{make_suffix(target_months)}.xlsx"
+
+
+def make_unmapped_outname(ki: int, target_months: List[int]) -> str:
+    return f"unmapped_{ki}ki_{make_suffix(target_months)}.xlsx"
+
+
+def norm_key(s: str) -> str:
+    """
+    テンプレの見た目ゆれ吸収用（スペース/改行/全角→半角/スラッシュ等）
+    """
+    s = unicodedata.normalize("NFKC", str(s or ""))
     s = s.replace("／", "/")
+    s = s.replace("\u3000", " ")
     s = s.replace("\n", "")
-    s = re.sub(r"\s+", "", s) # 空白は全部消す
-
-    return s
-
-# ----------------------------
-# Masters
-# ----------------------------
-
-@dataclass(frozen=True)
-class VegRule:
-    suffix: str
-    bucket: str  # "べビーリーフ" | "べビーリーフ以外" | "加工用"
+    s = re.sub(r"\s+", "", s)  # 空白は全削除
+    return s.strip()
 
 
+# ============================================================
+# IO dataclasses
+# ============================================================
 @dataclass
-class Masters:
-    company_map: Dict[str, str]
-    veg_rules: Dict[str, VegRule]
+class Inputs:
+    norm_src: Path
+    master: Path
+    harvest_template: Path
+    report_template: Path
 
 
-def load_masters(master_path: Path) -> Masters:
-    comp = pd.read_excel(master_path, sheet_name="企業名")
-    if not {"元データ", "変換後名"}.issubset(set(comp.columns)):
-        raise ValueError("master[企業名] must have columns: 元データ, 変換後名")
-
-    company_map: Dict[str, str] = {}
-    for _, r in comp.iterrows():
-        src = norm_text(r["元データ"])
-        dst = r["変換後名"]
-        dst = norm_text(dst) if isinstance(dst, str) else dst
-        company_map[src] = dst
-
-    veg = pd.read_excel(master_path, sheet_name="収穫野菜名")
-    need = {"元データ", "変換後名（企業名にくっつける）", "振り分け"}
-    if not need.issubset(set(veg.columns)):
-        raise ValueError("master[収穫野菜名] must have columns: 元データ, 変換後名（企業名にくっつける）, 振り分け")
-
-    veg_rules: Dict[str, VegRule] = {}
-    for _, r in veg.iterrows():
-        src = norm_text(r["元データ"])
-        suffix = r["変換後名（企業名にくっつける）"]
-        bucket = r["振り分け"]
-        suffix = norm_text(suffix) if isinstance(suffix, str) else ""
-        bucket = norm_text(bucket) if isinstance(bucket, str) else "不明"
-        veg_rules[src] = VegRule(suffix=suffix, bucket=bucket)
-
-    return Masters(company_map=company_map, veg_rules=veg_rules)
-
-
-# ----------------------------
-# Mapping
-# ----------------------------
-
-def map_company(raw_company: str, masters: Masters) -> Optional[str]:
-    if not isinstance(raw_company, str):
-        return None
-    raw_company = norm_text(raw_company)
-
-    if raw_company in masters.company_map:
-        v = masters.company_map[raw_company]
-        if v in (None, "", "×") or (isinstance(v, float) and pd.isna(v)):
-            return None
-        return norm_text(v) if isinstance(v, str) else v
-
-    base = raw_company.split("/")[0]
-    if base in set(v for v in masters.company_map.values() if isinstance(v, str)):
-        return base
-
-    return None
-
-
-def map_veg(raw_veg: str, masters: Masters) -> Tuple[str, str, str]:
-    if not isinstance(raw_veg, str):
-        return (str(raw_veg), "不明", "")
-
-    raw_veg = norm_text(raw_veg)
-
-    if raw_veg.startswith("BL"):
-        cultivar = raw_veg.replace("BL", "", 1)
-        return (f"ベビーリーフ　{cultivar}", "べビーリーフ", "")
-
-    if raw_veg in masters.veg_rules:
-        rule = masters.veg_rules[raw_veg]
-        return (raw_veg, rule.bucket, rule.suffix)
-
-    if raw_veg.startswith("ベビーリーフ"):
-        return (raw_veg, "べビーリーフ", "")
-
-    return (raw_veg, "不明", "")
-
-
-def company_proc_for_bucket(company_norm: str, bucket: str, suffix: str) -> str:
-    return company_norm if bucket == "べビーリーフ" else company_norm + (suffix or "")
-
-
-def company_key_for_report(company_proc: str) -> str:
-    if "/" not in company_proc:
-        return company_proc
-    base, suffix = company_proc.split("/", 1)
-    return f"{base}\n/{suffix}"
-
-
-# ----------------------------
-# Read 正規化.xlsx
-# ----------------------------
-
-def read_norm_xlsx(norm_src: Path) -> pd.DataFrame:
-    df = pd.read_excel(norm_src, sheet_name=0)
-    df.columns = [norm_text(c) for c in df.columns]
-
-    rename = {}
-    for c in df.columns:
-        if c in ("得意先名", "企業", "企業名"):
-            rename[c] = "企業名"
-        if c in ("収穫物", "野菜名", "品目", "作物", "作物名", "収穫野菜名"):
-            rename[c] = "収穫野菜名"
-        if c in ("収穫量(g)", "収穫量（g）", "収穫量（ｇ）", "収穫量", "重量(g)", "重量（g）", "重量"):
-            rename[c] = "収穫量（ｇ）"
-    df = df.rename(columns=rename)
-
-    need = {"収穫日", "企業名", "収穫野菜名", "収穫量（ｇ）"}
-    missing = need - set(df.columns)
+# ============================================================
+# Master
+# ============================================================
+def validate_master(master_path: Path) -> None:
+    xls = pd.ExcelFile(master_path)
+    needed = {"企業名", "収穫野菜名"}
+    got = set(xls.sheet_names)
+    missing = needed - got
     if missing:
-        raise ValueError(f"正規化ファイルに必要列がありません: {missing}")
+        raise SystemExit(f"[ERROR] master missing sheets: {sorted(missing)}")
 
-    df["収穫日_parsed"] = pd.to_datetime(df["収穫日"], errors="coerce")
-    df["企業名"] = df["企業名"].map(norm_text)
-    df["収穫野菜名"] = df["収穫野菜名"].map(norm_text)
+
+def read_master_maps(master_path: Path) -> tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    # 企業名: A=元, B=変換後（×は除外）
+    df_c = pd.read_excel(master_path, sheet_name="企業名", usecols=[0, 1], dtype=str).fillna("")
+    company_map = {a.strip(): b.strip() for a, b in zip(df_c.iloc[:, 0], df_c.iloc[:, 1]) if a.strip()}
+
+    # 収穫野菜名: A=元, B=suffix, C=bucket
+    df_v = pd.read_excel(master_path, sheet_name="収穫野菜名", usecols=[0, 1, 2], dtype=str).fillna("")
+    veg_map: Dict[str, Dict[str, str]] = {}
+    for a, b, c in zip(df_v.iloc[:, 0], df_v.iloc[:, 1], df_v.iloc[:, 2]):
+        k = a.strip()
+        if not k:
+            continue
+        veg_map[k] = {"suffix": b.strip(), "bucket": c.strip()}
+    return company_map, veg_map
+
+
+# ============================================================
+# Load norm
+# ============================================================
+def load_norm(norm_src: Path) -> pd.DataFrame:
+    df = pd.read_excel(norm_src)
+
+    def norm_col(s):
+        s = unicodedata.normalize("NFKC", str(s)).strip()
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    df = df.rename(columns={c: norm_col(c) for c in df.columns})
+
+    if "収穫量(g)" not in df.columns:
+        raise SystemExit(f"[ERROR] 収穫量(g) が見つかりません。cols={list(df.columns)}")
+
+    df["収穫量(g)"] = pd.to_numeric(df["収穫量(g)"], errors="coerce")
     return df
 
 
-def normalize_from_norm_df(df: pd.DataFrame, masters: Masters, month: int) -> pd.DataFrame:
-    rows = []
-    for _, r in df.iterrows():
-        d = r["収穫日_parsed"]
-        if pd.isna(d) or int(d.month) != int(month):
+# ============================================================
+# Normalize / Map
+# ============================================================
+def normalize_and_map(df_norm: pd.DataFrame, master_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    required_cols = ["収穫日", "得意先名", "収穫物", "収穫量(g)"]
+    missing = [c for c in required_cols if c not in df_norm.columns]
+    if missing:
+        raise SystemExit(f"[ERROR] 正規化.xlsx に必要列がありません: {missing}")
+
+    company_map, veg_map = read_master_maps(master_path)
+
+    rows_ok: list[dict] = []
+    rows_ng: list[dict] = []
+
+    for _, r in df_norm.iterrows():
+        harvest_date = r["収穫日"]
+        company_raw = str(r["得意先名"]).strip()
+        crop_raw = str(r["収穫物"]).strip()
+        amount = r["収穫量(g)"]
+
+        # 企業名変換
+        if company_raw not in company_map:
+            rows_ng.append(
+                {"type": "company_unmapped", "得意先名": company_raw, "収穫物": crop_raw, "収穫日": harvest_date, "収穫量(g)": amount}
+            )
             continue
 
-        comp_norm = map_company(r["企業名"], masters)
-        veg_std, bucket, suffix = map_veg(r["収穫野菜名"], masters)
+        company_conv = company_map[company_raw]
+        if company_conv == "×":
+            rows_ng.append(
+                {"type": "company_excluded(×)", "得意先名": company_raw, "変換後名": company_conv, "収穫物": crop_raw, "収穫日": harvest_date, "収穫量(g)": amount}
+            )
+            continue
 
-        company_proc = None
-        if comp_norm is not None:
-            company_proc = company_proc_for_bucket(comp_norm, bucket, suffix)
+        # 収穫物変換（suffix/bucket）
+        if crop_raw not in veg_map:
+            rows_ng.append(
+                {"type": "crop_unmapped", "得意先名": company_raw, "変換後名": company_conv, "収穫物": crop_raw, "収穫日": harvest_date, "収穫量(g)": amount}
+            )
+            continue
 
-        rows.append({
-            "month": int(d.month),
-            "date": d.date(),
-            "company_raw": r["企業名"],
-            "veg_raw": r["収穫野菜名"],
-            "company_proc": company_proc,
-            "veg": veg_std,
-            "bucket": bucket,
-            "amount_g": float(r["収穫量（ｇ）"]) if r["収穫量（ｇ）"] not in (None, "") else 0.0,
-        })
+        suffix = veg_map[crop_raw]["suffix"]
+        bucket = veg_map[crop_raw]["bucket"]
 
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(["date", "company_proc", "veg"], na_position="last").reset_index(drop=True)
-    return out
+        # 強制救済（マスタが揺れても加工BLは加工用に寄せる）
+        if "加工BL" in norm_key(crop_raw):
+            bucket = "加工用"
+            suffix = "/加工BL"
 
-def is_nikken(company_proc: str) -> bool:
-    """
-    日建判定（要調整ポイント）
-    company_proc 例: '日建/葉物野菜' や '日建' を想定
-    """
-    if not isinstance(company_proc, str):
-        return False
-    base = company_proc.split("/", 1)[0]
-    base = norm_text(base)
-    return ("日建" in base)  # ここは必要なら厳密一致に変えてOK
+        if not bucket:
+            rows_ng.append(
+                {"type": "bucket_unmapped", "得意先名": company_raw, "変換後名": company_conv, "収穫物": crop_raw, "suffix": suffix, "収穫日": harvest_date, "収穫量(g)": amount}
+            )
+            continue
 
+        # company_proc（確定ロジック）
+        if bucket == "べビーリーフ":
+            company_proc = company_conv
+        else:
+            company_proc = f"{company_conv}{suffix}"
 
-def find_total_block_rows(ws, label: str) -> dict:
-    """
-    合計ブロック（例: '企業月間生産量合計', '月間総合計'）の行を探して、
-    58期/59期/増減 の行番号を返す。
-    前提：B列にラベル、C列に '58期' '59期' '増　減' が並ぶ形式。
-    """
-    # B列でラベルを探す
-    target_row = None
-    for r in range(1, ws.max_row + 1):
-        v = ws.cell(r, 2).value
-        if isinstance(v, str) and norm_text(v) == label:
-            target_row = r
-            break
-    if target_row is None:
-        raise ValueError(f"[report] total label not found: {label} (sheet={ws.title})")
+        rows_ok.append(
+            {
+                "収穫日": harvest_date,
+                "company_raw": company_raw,
+                "company_conv": company_conv,
+                "crop_raw": crop_raw,
+                "suffix": suffix,
+                "bucket": bucket,
+                "company_proc": company_proc,
+                "収穫量(g)": amount,
+            }
+        )
 
-    # ラベル行の直下〜数行に 58期/59期/増減 がある前提で探す（柔軟に）
-    rows = {}
-    for r in range(target_row, min(target_row + 10, ws.max_row) + 1):
-        v = ws.cell(r, 3).value
-        if isinstance(v, str):
-            vv = norm_text(v)
-            if vv == "58期":
-                rows["prev"] = r
-            elif vv == "59期":
-                rows["curr"] = r
-            elif "増" in vv:
-                rows["diff"] = r
-    # 最低限 prev/curr は必須
-    if "prev" not in rows or "curr" not in rows:
-        raise ValueError(f"[report] total rows not found under label={label} (sheet={ws.title})")
+    df_ok = pd.DataFrame(rows_ok)
+    df_ng = pd.DataFrame(rows_ng)
 
-    return rows
+    # 収穫量を数値化（壊れた値はunmappedへ）
+    if not df_ok.empty:
+        df_ok["収穫量(g)"] = pd.to_numeric(df_ok["収穫量(g)"], errors="coerce")
+        bad = df_ok["収穫量(g)"].isna()
+        if bad.any():
+            moved = df_ok[bad].copy()
+            moved["type"] = "amount_not_number"
+            df_ng = pd.concat([df_ng, moved], ignore_index=True)
+            df_ok = df_ok[~bad].copy()
 
-# ----------------------------
-# Harvest rebuild: C~F clear from row 3, write from row 7
-# ----------------------------
-
-def clear_range(ws, start_row: int, start_col: int, end_col: int):
-    r = start_row
-    while True:
-        # 終端判定：C列が空で、D〜Fも空なら終わり（無限ループ防止）
-        if all(ws.cell(r, c).value in (None, "") for c in range(start_col, end_col + 1)):
-            break
-        for c in range(start_col, end_col + 1):
-            ws.cell(r, c).value = None
-        r += 1
+    return df_ok, df_ng
 
 
-def write_harvest_rebuild(
-    harvest_template: Path,
+# ============================================================
+# Unmapped output
+# ============================================================
+def write_unmapped(path: Path, df_unmapped: pd.DataFrame) -> None:
+    if df_unmapped is None or df_unmapped.empty:
+        pd.DataFrame([{"status": "no unmapped rows"}]).to_excel(path, index=False)
+        return
+    df_unmapped.to_excel(path, index=False)
+
+
+# ============================================================
+# Harvest_all (UI: 月別シートへ羅列)
+# ============================================================
+def clear_harvest_rows(ws, start_row: int = 2, col_start: int = 1, col_end: int = 6) -> None:
+    max_row = ws.max_row
+    for r in range(start_row, max_row + 1):
+        for c in range(col_start, col_end + 1):
+            ws.cell(row=r, column=c).value = None
+
+
+def write_harvest_all_by_month_sheets(
+    template_path: Path,
     out_path: Path,
-    norm: pd.DataFrame,
-    month: int,
-    farm_name: str = "愛川",
-    write_start_row: int = 7,  # ★例(3〜6)は触らない
+    df_ok: pd.DataFrame,
+    target_kis: List[int],
 ) -> None:
-    wb = openpyxl.load_workbook(harvest_template)
-    sheet_name = f"{month}月"
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"収穫データテンプレにシート '{sheet_name}' がありません。存在: {wb.sheetnames}")
-    ws = wb[sheet_name]
+    wb = load_workbook(template_path)
 
-    # ★仕様：C〜Fの3行目以降を毎回削除（例は3〜6だが「値は入れない」方針なので、
-    # クリアは3行目から行う。ただし書き込みは7行目から）
-    clear_range(ws, start_row=3, start_col=3, end_col=6)
+    df_m = df_ok.copy()
+    df_m["収穫日"] = pd.to_datetime(df_m["収穫日"], errors="coerce")
+    df_m = df_m.dropna(subset=["収穫日"]).copy()
 
-    sub = norm[norm["company_proc"].notna()].copy()
-    sub = sub.sort_values(["date", "company_proc", "veg"]).reset_index(drop=True)
+    # ki列を作って target_kis で絞る（年度混入を防止）
+    df_m["ki"] = df_m["収穫日"].apply(calc_ki)
+    df_m = df_m[df_m["ki"].isin(list(map(int, target_kis)))].copy()
 
-    row = write_start_row
-    written = 0
-    for rr in sub.itertuples(index=False):
-        ws.cell(row, 2).value = farm_name         # B
-        ws.cell(row, 3).value = rr.date           # C
-        ws.cell(row, 4).value = rr.company_proc   # D
-        ws.cell(row, 5).value = rr.veg            # E
-        ws.cell(row, 6).value = float(rr.amount_g)# F
-        row += 1
-        written += 1
+    sheet_months = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    start_row = 2
+
+    for m in sheet_months:
+        sheet_name = f"{m}月"
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+        clear_harvest_rows(ws, start_row=start_row, col_start=1, col_end=6)
+
+        dmm = df_m[df_m["収穫日"].dt.month == m].copy()
+        if dmm.empty:
+            continue
+
+        dmm = dmm.sort_values(["収穫日", "company_proc", "crop_raw"], kind="mergesort")
+
+        r = start_row
+        harvest_id = 1
+        for _, row in dmm.iterrows():
+            ws.cell(row=r, column=1).value = harvest_id
+            ws.cell(row=r, column=2).value = "愛川"
+            ws.cell(row=r, column=3).value = row["収穫日"].date()
+            ws.cell(row=r, column=4).value = row.get("company_proc", "")
+            ws.cell(row=r, column=5).value = row.get("crop_raw", "")
+            ws.cell(row=r, column=6).value = float(row["収穫量(g)"]) if pd.notna(row["収穫量(g)"]) else None
+            r += 1
+            harvest_id += 1
 
     wb.save(out_path)
-    print(f"[harvest] rebuild_written={written} (write_from_row={write_start_row})")
 
 
-# ----------------------------
-# Report write (same as before): 58期キー→59期行、無ければ追加
-# ----------------------------
-
-def find_cell(ws, value) -> Optional[Tuple[int, int]]:
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            if ws.cell(r, c).value == value:
-                return r, c
-    return None
+# ============================================================
+# Report helpers
+# ============================================================
+def pick_sheet_name(wb, keyword: str) -> str:
+    for n in wb.sheetnames:
+        if keyword in n:
+            return n
+    raise SystemExit(f"[ERROR] report sheet not found by keyword: {keyword} (sheets={wb.sheetnames})")
 
 
-def build_month_column_map(ws) -> Dict[int, int]:
-    pos = find_cell(ws, "10月")
-    if not pos:
-        raise ValueError(f"月ヘッダ（例: '10月'）が見つかりません: sheet={ws.title}")
-    header_row = pos[0]
-
-    month_cols: Dict[int, int] = {}
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(header_row, c).value
-        if isinstance(v, str) and re.fullmatch(r"\d{1,2}月", v):
-            m = int(v.replace("月", ""))
-            month_cols[m] = c
-    return month_cols
-
-
-def index_rows_for_curr_ki(ws, key_col: int, prev_ki: int, curr_ki: int) -> Dict[str, int]:
-    prev = f"{prev_ki}期"
-    curr = f"{curr_ki}期"
-
-    out: Dict[str, int] = {}
-    r = 1
-    while r <= ws.max_row:
-        if ws.cell(r, 3).value == prev:
-            key = ws.cell(r, key_col).value
-            if isinstance(key, str) and key.strip():
-                if ws.cell(r + 1, 3).value == curr:
-                    out[key_norm(key)] = r + 1
-        r += 1
-    return out
-
-
-def next_no_value(ws) -> int:
-    mx = 0
-    for r in range(1, ws.max_row + 1):
-        v = ws.cell(r, 1).value
-        if isinstance(v, (int, float)):
-            mx = max(mx, int(v))
-    return mx + 1 if mx > 0 else 1
-
-
-def append_company_block(ws, key: str, prev_ki: int, curr_ki: int) -> int:
-    start_no = next_no_value(ws)
-    r = ws.max_row + 1
-
-    ws.cell(r, 1).value = start_no
-    ws.cell(r, 2).value = key
-    ws.cell(r, 3).value = f"{prev_ki}期"
-
-    ws.cell(r + 1, 3).value = f"{curr_ki}期"
-    ws.cell(r + 2, 3).value = "増　減"
-    ws.cell(r + 3, 3).value = "稼働棟数"
-
-    for c in range(4, ws.max_column + 1):
-        col = get_column_letter(c)
-        ws.cell(r + 2, c).value = f"={col}{r+1}-{col}{r}"
-
-    return r + 1
-
-
-def write_report(
-    report_template: Path,
-    out_path: Path,
-    norm: pd.DataFrame,
-    ki: int,
-    month: int,
-    allow_append_rows: bool = False, # 推奨：テンプレに全部入れるなら False
-) -> Dict[str, float]:
-    wb = openpyxl.load_workbook(report_template)
-
-    sub = norm[norm["company_proc"].notna()].copy()
-    sub["kg"] = sub["amount_g"].astype(float) / 1000.00
-
-    sheets = {
-        "べビーリーフ": "企業月間生産量（ベビーリーフ）",
-        "べビーリーフ以外": "企業月間生産量（ベビーリーフ以外）",
-        "加工用": "企業別月間生産量 (加工用） ",
+def find_month_columns(ws) -> Dict[int, int]:
+    labels = {
+        10: "10月", 11: "11月", 12: "12月",
+        1: "1月", 2: "2月", 3: "3月",
+        4: "4月", 5: "5月", 6: "6月",
+        7: "7月", 8: "8月", 9: "9月",
     }
 
-    prev_ki = ki - 1
-    written_sum_by_bucket: Dict[str, float] = {}
+    for r in range(1, 201):
+        row_vals = []
+        for c in range(1, 51):
+            v = ws.cell(r, c).value
+            if isinstance(v, str):
+                v = v.strip()
+            row_vals.append(v)
 
-    for bucket, sname in sheets.items():
-        if sname not in wb.sheetnames:
-            raise ValueError(f"月初報告テンプレにシート '{sname}' がありません。存在: {wb.sheetnames}")
+        if "10月" in row_vals and "9月" in row_vals:
+            month_to_col: Dict[int, int] = {}
+            for m, lab in labels.items():
+                if lab in row_vals:
+                    month_to_col[m] = row_vals.index(lab) + 1
+            return month_to_col
 
-        ws = wb[sname]
-        month_cols = build_month_column_map(ws)
-        if month not in month_cols:
-            raise ValueError(f"{sname} に {month}月 がありません。検出月={sorted(month_cols.keys())}")
-        month_col = month_cols[month]
-
-        row_index = index_rows_for_curr_ki(ws, key_col=2, prev_ki=prev_ki, curr_ki=ki)
-
-        agg = sub[sub["bucket"] == bucket].groupby("company_proc", as_index=False)["kg"].sum()
-
-        wrote_kg = 0.0
-        for _, r in agg.iterrows():
-            company_proc = str(r["company_proc"])
-            val = round(float(r["kg"]), 2)
-
-            if bucket == "べビーリーフ":
-                key = key_norm(company_proc)
-            else:
-                key = key_norm(company_key_for_report(company_proc))
-
-            if key not in row_index:
-                if not allow_append_rows:
-                    raise ValueError(f"[report] row not found: sheet={sname}, key={key}")
-                row_index[key] = append_company_block(ws, key, prev_ki=prev_ki, curr_ki=ki)
-
-            ws.cell(row_index[key], month_col).value = val
-            wrote_kg += float(r["kg"])
-
-        # ---- 合計行（企業月間合計 / 月間総合計）を書き戻す ----
-        # sub: normからbucketで絞ったデータ（kg）
-        sub_bucket = sub[sub["bucket"] == bucket].copy()
-        sub_bucket["is_nikken"] = sub_bucket["company_proc"].map(is_nikken)
-
-        # 企業月間合計：日建除外
-        total_excl = float(sub_bucket.loc[~sub_bucket["is_nikken"], "kg"].sum())
-        # 月間総合計：日建含む
-        total_all = float(sub_bucket["kg"].sum())
-
-        # テンプレの合計ブロック行を探す（B列ラベル）
-        rows_company_total = find_total_block_rows(ws, "企業月間生産量合計")
-        rows_grand_total   = find_total_block_rows(ws, "月間総合計")
-
-        # 今回は「対象月だけ」書く（month_col）
-        # 58期/59期を両方同じ値で埋めるのではなく、本来は prev_ki/curr_ki を別データから出す。
-        # いまは“59期の対象月”を作っているので curr に入れる。prev は空欄にするか、比較用に別実装。
-        ws.cell(rows_company_total["curr"], month_col).value = round(total_excl, 2)
-        ws.cell(rows_grand_total["curr"],   month_col).value = round(total_all, 2)
-
-        # 増減はテンプレの式を活かす（あれば）。無ければ値を書いてもOK。
-        # ここでは式がある前提で触らない（UI崩壊防止）
+    raise SystemExit("[ERROR] report template: month header row (10月..9月) not found")
 
 
-        written_sum_by_bucket[bucket] = wrote_tons
+def _is_total_row_name(name: str) -> bool:
+    s = (name or "").strip()
+    return ("企業総合計" in s) or ("月間総合計" in s) or ("総合計" in s) or ("合計" in s)
+
+
+def safe_set_value(ws, row: int, col: int, value) -> None:
+    cell = ws.cell(row=row, column=col)
+    cell.value = None
+    cell.value = value
+
+
+def recalc_totals(ws, row_idx: int) -> None:
+    """
+    report_template の合計列を “値” で埋める。
+    - 10月〜3月: 4〜9列 → 上期(10列)
+    - 4月〜9月: 11〜16列 → 下期(17列)
+    - 合計: 18列
+    """
+    first_half_cols = range(4, 10)    # 4..9
+    second_half_cols = range(11, 17)  # 11..16
+
+    first_half = 0.0
+    second_half = 0.0
+
+    for col in first_half_cols:
+        v = ws.cell(row=row_idx, column=col).value
+        if isinstance(v, (int, float)):
+            first_half += float(v)
+
+    for col in second_half_cols:
+        v = ws.cell(row=row_idx, column=col).value
+        if isinstance(v, (int, float)):
+            second_half += float(v)
+
+    ws.cell(row=row_idx, column=10).value = round(first_half, 2)
+    ws.cell(row=row_idx, column=17).value = round(second_half, 2)
+    ws.cell(row=row_idx, column=18).value = round(first_half + second_half, 2)
+
+
+# ============================================================
+# merged cell (高速化: キャッシュ)
+# ============================================================
+def _build_merged_cache(ws):
+    # openpyxl range list
+    ranges = list(ws.merged_cells.ranges)
+    cache: Dict[Tuple[int, int], Tuple[int, int]] = {}  # (r,c) -> (topr, topc)
+    return ranges, cache
+
+
+def _merged_topleft_value(ws, r: int, c: int, merged_ranges, merged_cache) -> object:
+    """
+    結合セル対策（キャッシュ付き）
+    """
+    key = (r, c)
+    if key in merged_cache:
+        tr, tc = merged_cache[key]
+        return ws.cell(tr, tc).value
+
+    coord = ws.cell(r, c).coordinate
+    for rng in merged_ranges:
+        if coord in rng:
+            merged_cache[key] = (rng.min_row, rng.min_col)
+            return ws.cell(rng.min_row, rng.min_col).value
+
+    merged_cache[key] = (r, c)
+    return ws.cell(r, c).value
+
+
+# ============================================================
+# ★ 期ブロック検出（完成版：スコアリングで本物を選ぶ）
+# ============================================================
+def _find_all_ki_label_rows(ws, merged_ranges, merged_cache, max_row: int) -> List[Tuple[int, int]]:
+    ki_rows: List[Tuple[int, int]] = []
+    for r in range(1, max_row + 1):
+        v = _merged_topleft_value(ws, r, 3, merged_ranges, merged_cache)  # C列
+        if v is None:
+            continue
+        s = v.strip() if isinstance(v, str) else ""
+        m = KI_LABEL_RE.match(s)
+        if not m:
+            continue
+        ki_rows.append((r, int(m.group(1))))
+    ki_rows.sort(key=lambda x: x[0])
+    return ki_rows
+
+
+def _looks_like_company_row(ws, merged_ranges, merged_cache, r: int) -> bool:
+    bad_words = ("増減", "稼働", "KPI", "目標", "実績", "差", "前年差", "前月差", "前年差異")
+
+    # B列優先、無ければA列
+    for c in (2, 1):
+        v = _merged_topleft_value(ws, r, c, merged_ranges, merged_cache)
+        if isinstance(v, str):
+            name = v.strip()
+            if not name:
+                continue
+            if any(w in name for w in bad_words):
+                return False
+            if _is_total_row_name(name):
+                return False
+            if KI_LABEL_RE.match(name):
+                return False
+            return True
+    return False
+
+
+def _choose_best_label_row_for_ki(
+    ws,
+    merged_ranges,
+    merged_cache,
+    ki_rows: List[Tuple[int, int]],
+    target_ki: int,
+    max_row: int,
+    debug: bool = False,
+) -> Optional[int]:
+    all_label_rows = [r for r, _ in ki_rows]
+    candidates = [r for r, k in ki_rows if k == target_ki]
+
+    best_row = None
+    best_score = -1
+
+    # “本物ブロック”は短すぎない前提（ここが誤判定の核心）
+    MIN_SPAN = 50
+    WINDOW = 20
+
+    for r in candidates:
+        nxt = None
+        for rr in all_label_rows:
+            if rr > r:
+                nxt = rr
+                break
+        end = (nxt - 1) if nxt else max_row
+        span = end - r
+
+        if span < MIN_SPAN:
+            continue
+
+        hit = 0
+        for i in range(1, WINDOW + 1):
+            if r + i > max_row:
+                break
+            if _looks_like_company_row(ws, merged_ranges, merged_cache, r + i):
+                hit += 1
+
+        # スコア：企業行の密度を最優先、次にスパン
+        score = hit * 1000 + span
+
+        if debug:
+            print(f"[DEBUG] ki={target_ki} label_row={r} span={span} company_hit={hit} score={score}")
+
+        if score > best_score:
+            best_score = score
+            best_row = r
+
+    return best_row
+
+
+def build_ki_block_ranges(
+    ws,
+    target_kis: List[int],
+    max_row: int = 4000,
+    debug: bool = False,
+) -> Dict[int, Tuple[int, int]]:
+    merged_ranges, merged_cache = _build_merged_cache(ws)
+
+    ki_rows = _find_all_ki_label_rows(ws, merged_ranges, merged_cache, max_row=max_row)
+    if not ki_rows:
+        raise SystemExit("[ERROR] cannot find any ki label rows in template (C column).")
+
+    chosen_label: Dict[int, int] = {}
+    for ki in target_kis:
+        rr = _choose_best_label_row_for_ki(ws, merged_ranges, merged_cache, ki_rows, ki, max_row=max_row, debug=debug)
+        if rr is not None:
+            chosen_label[int(ki)] = rr
+
+    if debug:
+        print("[DEBUG] chosen_label_rows:", chosen_label)
+
+    if not chosen_label:
+        raise SystemExit("[ERROR] cannot choose ki label rows (all candidates too weak).")
+
+    items = sorted(chosen_label.items(), key=lambda x: x[1])  # (ki, row)
+    ranges: Dict[int, Tuple[int, int]] = {}
+    for i, (ki, row) in enumerate(items):
+        start = row + 1
+        end = (items[i + 1][1] - 1) if i + 1 < len(items) else max_row
+        ranges[int(ki)] = (start, end)
+
+    if debug:
+        print("[DEBUG] ki block ranges:", ranges)
+
+    return ranges
+
+
+def build_company_rows_by_ki_block(
+    ws,
+    target_kis: List[int],
+    max_row: int = 4000,
+    debug: bool = False,
+) -> tuple[Dict[int, Dict[str, int]], Dict[int, int]]:
+    """
+    期ブロック（スコアリングで選んだ58/59）を対象に、企業行を抽出する。
+    戻り値:
+      - row_map_by_ki[ki][norm_company] = row_idx
+      - total_row_by_ki[ki] = 合計行 row_idx（見つかった場合）
+    """
+    merged_ranges, merged_cache = _build_merged_cache(ws)
+
+    block_ranges = build_ki_block_ranges(ws, target_kis=target_kis, max_row=max_row, debug=debug)
+
+    row_map_by_ki: Dict[int, Dict[str, int]] = {int(k): {} for k in target_kis}
+    total_row_by_ki: Dict[int, int] = {}
+
+    def get_name(r: int) -> str:
+        for cc in (2, 1):
+            v = _merged_topleft_value(ws, r, cc, merged_ranges, merged_cache)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    bad_words = ("増減", "稼働", "KPI", "目標", "実績", "差", "前年差", "前月差", "前年差異")
+
+    for ki, (start, end) in block_ranges.items():
+        if int(ki) not in row_map_by_ki:
+            continue
+        for r in range(start, min(end, max_row) + 1):
+            name = get_name(r)
+            if not name:
+                continue
+            if any(w in name for w in bad_words):
+                continue
+
+            if _is_total_row_name(name):
+                total_row_by_ki.setdefault(int(ki), r)
+                continue
+
+            key = norm_key(name)
+            row_map_by_ki[int(ki)].setdefault(key, r)
+
+    if debug:
+        for ki in sorted(row_map_by_ki.keys()):
+            print(f"[DEBUG] ki={ki} company_rows={len(row_map_by_ki[ki])} total_row={total_row_by_ki.get(ki)}")
+
+    return row_map_by_ki, total_row_by_ki
+
+
+def clear_report_cells_for_rows(
+    ws,
+    month_to_col: Dict[int, int],
+    rows: List[int],
+    target_months: List[int],
+) -> None:
+    for r in rows:
+        for m in target_months:
+            col = month_to_col.get(int(m))
+            if col:
+                safe_set_value(ws, r, col, None)
+        safe_set_value(ws, r, 10, None)
+        safe_set_value(ws, r, 17, None)
+        safe_set_value(ws, r, 18, None)
+
+
+def recalc_total_rows_by_blocks(
+    ws,
+    month_to_col: Dict[int, int],
+    row_map_by_ki: Dict[int, Dict[str, int]],
+    total_row_by_ki: Dict[int, int],
+) -> None:
+    for ki, total_row in total_row_by_ki.items():
+        rows = list(row_map_by_ki.get(int(ki), {}).values())
+        if not rows:
+            continue
+
+        for m, col in month_to_col.items():
+            s = 0.0
+            for r in rows:
+                v = ws.cell(r, col).value
+                if isinstance(v, (int, float)):
+                    s += float(v)
+            safe_set_value(ws, total_row, col, round(s, 2))
+
+        recalc_totals(ws, total_row)
+
+
+# ============================================================
+# Report writer
+# ============================================================
+def write_report_template(
+    report_template: Path,
+    out_path: Path,
+    df_ok: pd.DataFrame,
+    target_months: List[int],
+    target_kis: List[int],
+    report_unit: str,
+    debug: bool,
+) -> pd.DataFrame:
+    """
+    report_template を読み込み、df_ok を元に「対象期×対象月」だけ値上書きする。
+    UI崩壊防止：書式/罫線/結合は触らず value だけ上書きする
+    戻り値: テンプレ未登録/マスタ未登録などの unmapped 行（DataFrame）
+    """
+    wb = load_workbook(report_template)
+
+    sheet_by_bucket = {
+        "べビーリーフ": pick_sheet_name(wb, "企業月間生産量（ベビーリーフ）"),
+        "べビーリーフ以外": pick_sheet_name(wb, "企業月間生産量（ベビーリーフ以外）"),
+        "加工用": pick_sheet_name(wb, "加工用"),
+    }
+
+    df = df_ok.copy()
+    df["収穫日"] = pd.to_datetime(df["収穫日"], errors="coerce")
+    df = df.dropna(subset=["収穫日"]).copy()
+    df["month"] = df["収穫日"].dt.month
+    df["ki"] = df["収穫日"].apply(calc_ki)
+
+    df = df[df["month"].isin(list(map(int, target_months)))].copy()
+    df = df[df["ki"].isin(list(map(int, target_kis)))].copy()
+
+    g = (
+        df.groupby(["bucket", "company_proc", "ki", "month"], as_index=False)["収穫量(g)"]
+        .sum()
+        .rename(columns={"収穫量(g)": "amount_g"})
+    )
+
+    if report_unit == "kg":
+        g["amount"] = (g["amount_g"].astype(float) / 1000.0).round(2)
+    else:
+        g["amount"] = g["amount_g"].astype(float)
+
+    unmapped_rows: list[dict] = []
+
+    for bucket, sheet_name in sheet_by_bucket.items():
+        ws = wb[sheet_name]
+        month_to_col = find_month_columns(ws)
+
+        gb = g[g["bucket"] == bucket]
+        if gb.empty:
+            if debug:
+                print(f"[DEBUG] bucket={bucket} gb_rows=0 (skip)")
+            continue
+
+        kis_to_write = sorted(set(int(x) for x in gb["ki"].unique()))
+        months_to_write = sorted(set(int(x) for x in gb["month"].unique()))
+
+        row_map_by_ki, total_row_by_ki = build_company_rows_by_ki_block(
+            ws,
+            target_kis=target_kis,
+            max_row=4000,
+            debug=debug,
+        )
+
+        # クリア対象を「書ける行」だけに限定
+        rows_to_clear: list[int] = []
+        for ki2 in kis_to_write:
+            mki = row_map_by_ki.get(int(ki2), {})
+            for company in gb["company_proc"].unique():
+                key = norm_key(str(company).strip())
+                r = mki.get(key)
+                if r:
+                    rows_to_clear.append(r)
+        rows_to_clear = sorted(set(rows_to_clear))
+
+        clear_report_cells_for_rows(
+            ws,
+            month_to_col=month_to_col,
+            rows=rows_to_clear,
+            target_months=months_to_write,
+        )
+
+        touched_rows: set[int] = set()
+
+        for _, rr in gb.iterrows():
+            company = str(rr["company_proc"]).strip()
+            ki2 = int(rr["ki"])
+            m = int(rr["month"])
+            amt = float(rr["amount"])
+
+            if not company or ki2 <= 0:
+                continue
+
+            if m not in month_to_col:
+                unmapped_rows.append(
+                    {"type": "template_unmapped(month_col)", "bucket": bucket, "company_proc": company, "ki": ki2, "month": m, "amount": amt}
+                )
+                continue
+
+            key = norm_key(company)
+            row = row_map_by_ki.get(ki2, {}).get(key)
+            if not row:
+                unmapped_rows.append(
+                    {"type": "template_unmapped(company_row)", "bucket": bucket, "company_proc": company, "ki": ki2, "month": m, "amount": amt}
+                )
+                continue
+
+            col = month_to_col[m]
+            safe_set_value(ws, row, col, amt)
+            touched_rows.add(row)
+
+        for row_idx in touched_rows:
+            recalc_totals(ws, row_idx)
+
+        recalc_total_rows_by_blocks(
+            ws,
+            month_to_col=month_to_col,
+            row_map_by_ki=row_map_by_ki,
+            total_row_by_ki=total_row_by_ki,
+        )
+
+        if debug:
+            print(
+                f"[DEBUG] bucket={bucket} gb_rows={len(gb)} "
+                f"rows_to_clear={len(rows_to_clear)} touched_rows={len(touched_rows)} "
+                f"unmapped_total={len(unmapped_rows)}"
+            )
 
     wb.save(out_path)
-    return written_sum_by_bucket
+    return pd.DataFrame(unmapped_rows)
 
 
-def write_unmapped(out_path: Path, norm: pd.DataFrame) -> None:
-    unm_comp = sorted(norm.loc[norm["company_proc"].isna(), "company_raw"].dropna().unique().tolist())
-    unm_veg = sorted(norm.loc[norm["bucket"] == "不明", "veg_raw"].dropna().unique().tolist())
-    sample = norm[(norm["company_proc"].isna()) | (norm["bucket"] == "不明")].head(300)
+# ============================================================
+# Pipeline
+# ============================================================
+def run_pipeline(
+    *,
+    inputs: Inputs,
+    outdir: Path,
+    ki: int,
+    target_months: List[int],
+    target_kis: List[int],
+    do_validate: bool,
+    report_unit: str,
+    debug: bool,
+) -> None:
+    if do_validate:
+        validate_master(inputs.master)
 
-    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
-        pd.DataFrame({"unmapped_company_raw": unm_comp}).to_excel(w, index=False, sheet_name="企業名(未変換)")
-        pd.DataFrame({"unmapped_veg_raw": unm_veg}).to_excel(w, index=False, sheet_name="野菜名(未分類)")
-        sample.to_excel(w, index=False, sheet_name="サンプル行(最大300)")
+    report_out = outdir / make_report_outname(ki, target_months)
+    unmapped_out = outdir / make_unmapped_outname(ki, target_months)
+
+    df = load_norm(inputs.norm_src)
+    df_ok, df_ng = normalize_and_map(df, inputs.master)
+
+    if df_ok is None or df_ok.empty:
+        raise SystemExit("[ERROR] df_ok is empty. check master mapping or norm data.")
+
+    # harvest_all（監査用：UI提出形式）※年度混入を防ぐため、target_kis に [ki] を渡す
+    all_path = outdir / f"harvest_{ki}ki_all.xlsx"
+    write_harvest_all_by_month_sheets(inputs.harvest_template, all_path, df_ok, target_kis=[ki])
+    print("[INFO] saved harvest all(UI, by month sheets):", all_path)
+
+    # report
+    df_report_unmapped = write_report_template(
+        report_template=inputs.report_template,
+        out_path=report_out,
+        df_ok=df_ok,
+        target_months=target_months,
+        target_kis=target_kis,
+        report_unit=report_unit,
+        debug=debug,
+    )
+    if df_report_unmapped is not None and not df_report_unmapped.empty:
+        df_ng = pd.concat([df_ng, df_report_unmapped], ignore_index=True)
+
+    # unmapped
+    write_unmapped(unmapped_out, df_ng)
+
+    print("[INFO] saved report:", report_out)
+    print("[INFO] saved unmapped:", unmapped_out)
 
 
-def validate_totals(norm: pd.DataFrame, written_sum_by_bucket: Dict[str, float], tol: float = 1e-3) -> None:
-    sub = norm[norm["company_proc"].notna()].copy()
-    sub["kg"] = sub["amount_g"].astype(float) / 1000.00
+# ============================================================
+# CLI
+# ============================================================
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
 
-    expected = sub.groupby("bucket")["kg"].sum().to_dict()
-    for bucket, exp in expected.items():
-        got = written_sum_by_bucket.get(bucket, 0.0)
-        if abs(float(exp) - float(got)) > tol:
-            raise ValueError(f"[validate] bucket mismatch: {bucket}: expected={exp_all:.3f}kg, written={got_all:.3f}kg")
+    p.add_argument("--norm-src", required=True)
+    p.add_argument("--master", required=True)
+    p.add_argument("--harvest-template", required=True)
+    p.add_argument("--report-template", required=True)
+    p.add_argument("--ki", required=True, type=int)      # 基準期（ファイル名用/harvest_all用）
+    p.add_argument("--kis", default=None)                # "58,59"（reportへ書き込む対象期）
+    p.add_argument("--outdir", default="out")
+    p.add_argument("--validate", action="store_true")
+    p.add_argument("--report-unit", choices=["g", "kg"], default="kg")
+    p.add_argument("--debug", action="store_true")
 
-    exp_all = float(sub["tons"].sum())
-    got_all = float(sum(written_sum_by_bucket.values()))
-    if abs(exp_all - got_all) > tol:
-        raise ValueError(f"[validate] total mismatch: expected={exp_all:.6f}t, written={got_all:.6f}t")
+    mx = p.add_mutually_exclusive_group(required=True)
+    mx.add_argument("--month", type=int)
+    mx.add_argument("--months")
 
-
-def run_suffix(report_xlsx: Path, month: int, out_path: Path) -> None:
-    script = Path("fill_by_company_suffix.py")
-    if not script.exists():
-        return
-    cmd = [
-        sys.executable, str(script),
-        "--src", str(report_xlsx),
-        "--dst", str(out_path),
-        "--month", str(month),
-        "--out", str(out_path),
-        "--mode", "add",
-    ]
-    subprocess.run(cmd, check=True)
+    return p
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--norm-src", type=Path, required=True)
-    p.add_argument("--master", type=Path, required=True)
-    p.add_argument("--harvest-template", type=Path, required=True)
-    p.add_argument("--report-template", type=Path, required=True)
-    p.add_argument("--ki", type=int, required=True)
-    p.add_argument("--month", type=int, required=True)
-    p.add_argument("--outdir", type=Path, default=Path("out"))
-    p.add_argument("--farm-name", type=str, default="愛川")
-    p.add_argument("--validate", action="store_true")
+    parser = build_parser()
+    args = parser.parse_args()
+    debug = args.debug
 
-    args = p.parse_args()
-    args.outdir.mkdir(parents=True, exist_ok=True)
-
-    masters = load_masters(args.master)
-    raw = read_norm_xlsx(args.norm_src)
-    norm = normalize_from_norm_df(raw, masters, month=args.month)
-
-    harvest_out = args.outdir / f"harvest_{args.ki}ki_{args.month}.xlsx"
-    report_out = args.outdir / f"report_{args.ki}ki_{args.month}.xlsx"
-    unmapped_out = args.outdir / f"unmapped_{args.ki}ki_{args.month}.xlsx"
-    suffix_out = args.outdir / f"teisyutu_filled_{args.ki}ki_{args.month}.xlsx"
-
-    # harvest: rebuild
-    write_harvest_rebuild(
-        args.harvest_template,
-        harvest_out,
-        norm,
-        args.month,
-        farm_name=args.farm_name,
-        write_start_row=7,
+    inputs = Inputs(
+        norm_src=resolve_path(args.norm_src, "norm_src"),
+        master=resolve_path(args.master, "master"),
+        harvest_template=resolve_path(args.harvest_template, "harvest_template"),
+        report_template=resolve_path(args.report_template, "report_template"),
     )
+    outdir = ensure_outdir(args.outdir)
+    target_months = parse_target_months(args.month, args.months)
+    target_kis = parse_kis(args.kis, args.ki)
 
-    # report: rebuild (row auto append)
-    written_sum_by_bucket = write_report(
-        args.report_template,
-        report_out,
-        norm,
-        args.ki,
-        args.month,
-        allow_append_rows=True,
+    run_pipeline(
+        inputs=inputs,
+        outdir=outdir,
+        ki=int(args.ki),
+        target_months=target_months,
+        target_kis=target_kis,
+        do_validate=args.validate,
+        report_unit=args.report_unit,
+        debug=debug,
     )
-
-    write_unmapped(unmapped_out, norm)
-
-    if args.validate:
-        validate_totals(norm, written_sum_by_bucket)
-
-    suffix_msg = "(skip) fill_by_company_suffix.py not found"
-    if Path("fill_by_company_suffix.py").exists():
-        run_suffix(report_out, args.month, suffix_out)
-        suffix_msg = str(suffix_out)
-
-    print("OK")
-    print(f"- harvest:  {harvest_out}")
-    print(f"- report:   {report_out}")
-    print(f"- unmapped: {unmapped_out}")
-    print(f"- suffix:   {suffix_msg}")
 
 
 if __name__ == "__main__":
     main()
-
